@@ -217,6 +217,15 @@ import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
 import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
 import { useThreadQueuedCount } from "./ThreadQueueControl";
 import { ThreadGuestShareBar } from "./ThreadGuestShareBar";
+import { useOpenThreadLink } from "./useOpenThreadLink";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { resolveLinkedThreadOpen } from "@t3tools/client-runtime/linked-thread";
+import type { OrchestrationV2ThreadContinuedFrom } from "@t3tools/contracts";
+import { useEnvironments } from "../../state/environments";
+import { useLinkedEnvironments } from "../../state/peerLinks";
+import { Button } from "../../components/ui/Button";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText } from "../../components/ui/AppText";
 import { ThreadSideChatsRow } from "./ThreadSideChatsRow";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-scroll-position";
@@ -336,6 +345,105 @@ export interface ThreadDetailScreenProps {
 
 // iOS questions overlay the controls; Android questions stack with child approvals.
 const ComposerPanels = Platform.OS === "android" ? Animated.ScrollView : Animated.View;
+
+/** Shown while the thread continues on another machine; any new work here clears it. */
+function ThreadMovedBanner(props: {
+  readonly thread: EnvironmentThreadShell;
+  readonly canOperateThread: boolean;
+}) {
+  const gt = useGT();
+  const openThreadLink = useOpenThreadLink(props.thread.environmentId);
+  const clearMoved = useAtomCommand(threadEnvironment.clearMoved, { reportFailure: false });
+  const [busy, setBusy] = useState(false);
+  const movedTo = props.thread.movedTo;
+  if (movedTo === null) return null;
+  const keepWorkingHere = async () => {
+    setBusy(true);
+    const result = await clearMoved({
+      environmentId: props.thread.environmentId,
+      input: { threadId: props.thread.id },
+    });
+    setBusy(false);
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      Dialog.alert(
+        gt("Could not keep working here"),
+        errorDisplayMessage(squashAtomCommandFailure(result), m) ?? gt("Try again."),
+      );
+    }
+  };
+  return (
+    <View className="flex-row items-center gap-2 px-4 pb-2">
+      <SymbolView name="laptopcomputer" size={12} tintColorClassName="accent-foreground-muted" />
+      <AppText
+        accessibilityRole="link"
+        accessibilityHint={gt("Opens the thread on that machine")}
+        className="min-w-0 flex-1 text-xs text-foreground-muted underline"
+        numberOfLines={1}
+        onPress={() =>
+          openThreadLink(scopeThreadRef(movedTo.environmentId, movedTo.threadId), movedTo.title)
+        }
+      >
+        {gt("Moved to {label}", { label: movedTo.label })}
+      </AppText>
+      <Button
+        label={gt("Keep working here")}
+        tone="text"
+        disabled={busy || !props.canOperateThread}
+        onPress={() => void keepWorkingHere()}
+      />
+    </View>
+  );
+}
+
+/** Names the machine this thread continues from, and opens the thread there when this app can. */
+function ThreadContinuedFromRow(props: {
+  readonly thread: EnvironmentThreadShell;
+  readonly continuedFrom: OrchestrationV2ThreadContinuedFrom;
+}) {
+  const gt = useGT();
+  const { continuedFrom } = props;
+  const openThreadLink = useOpenThreadLink(props.thread.environmentId);
+  const linkedEnvironments = useLinkedEnvironments(props.thread.environmentId, [
+    continuedFrom.environmentId,
+  ]);
+  const { environments } = useEnvironments();
+  const own = environments.find(
+    (environment) => environment.environmentId === continuedFrom.environmentId,
+  );
+  const canOpen =
+    resolveLinkedThreadOpen({
+      environmentId: continuedFrom.environmentId,
+      viaEnvironmentId: props.thread.environmentId,
+      own: own && { connected: own.connection.phase === "connected" },
+      linked: linkedEnvironments.has(continuedFrom.environmentId),
+    }) !== "unavailable";
+  const text = gt("Continued from {label}", { label: own?.label ?? continuedFrom.label });
+  return (
+    <View className="flex-row items-center gap-2 px-4 pb-2">
+      <SymbolView name="laptopcomputer" size={12} tintColorClassName="accent-foreground-muted" />
+      {canOpen ? (
+        <AppText
+          accessibilityRole="link"
+          accessibilityHint={gt("Opens the thread on that machine")}
+          className="min-w-0 flex-1 text-xs text-foreground-muted underline"
+          numberOfLines={1}
+          onPress={() =>
+            openThreadLink(
+              scopeThreadRef(continuedFrom.environmentId, continuedFrom.threadId),
+              continuedFrom.title,
+            )
+          }
+        >
+          {text}
+        </AppText>
+      ) : (
+        <AppText className="min-w-0 flex-1 text-xs text-foreground-muted" numberOfLines={1}>
+          {text}
+        </AppText>
+      )}
+    </View>
+  );
+}
 
 // A child, so focus and app state changes do not re-render the thread body.
 // The native stack keeps covered screens mounted, so gate on focus too.
@@ -1754,6 +1862,16 @@ function ThreadDetailBody(
                     />
                     <ThreadGuestShareBar
                       threadRef={props.selectedThreadDetailRef}
+                      canOperateThread={props.canOperateThread}
+                    />
+                    {props.selectedThread.continuedFrom === null ? null : (
+                      <ThreadContinuedFromRow
+                        thread={props.selectedThread}
+                        continuedFrom={props.selectedThread.continuedFrom}
+                      />
+                    )}
+                    <ThreadMovedBanner
+                      thread={props.selectedThread}
                       canOperateThread={props.canOperateThread}
                     />
                     {props.draftMode ? null : (

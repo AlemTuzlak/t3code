@@ -9,6 +9,7 @@ export type ThreadActionMenuId =
   | "new-thread-on-branch"
   | "filter-by-project"
   | "turn-into-project"
+  | "continue-on-machine"
   | "project-settings"
   | "pin"
   | "unpin"
@@ -125,6 +126,8 @@ export interface ThreadActionMenuState {
   readonly snoozePresets: ReadonlyArray<SnoozePreset>;
   /** Guest links need their own grant, so the caller checks it instead of `canOperate`. */
   readonly canShareWithGuest?: boolean;
+  /** A thread in a project with a git remote, on a server that offers linked environments. "busy" while a run blocks it. */
+  readonly canContinueOnMachine?: "ready" | "busy" | null;
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
 }
@@ -257,6 +260,16 @@ export function buildThreadActionMenuItems(
               ? resolve(msg("Show all projects"))
               : resolve(msg("Filter by {project}", { project: state.projectFilter.label })),
             icon: "folder-tree",
+          },
+        ]
+      : []),
+    ...(state.canContinueOnMachine
+      ? [
+          {
+            id: "continue-on-machine" as const,
+            label: resolve(msg("Continue on another machine")),
+            icon: "git-branch",
+            disabled: state.canContinueOnMachine === "busy",
           },
         ]
       : []),

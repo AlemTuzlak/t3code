@@ -163,6 +163,7 @@ import {
   isUndeliveredMailboxSteer,
 } from "./NotificationMailbox.ts";
 import { EventSinkV2 } from "./EventSink.ts";
+import { importedHistoryTruncatedEvent, importedMessageEvents } from "./importedHistoryEvents.ts";
 import {
   decideGuestMessageSend,
   guestShareAfterCancelledSend,
@@ -654,6 +655,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.guest-share.close":
     case "thread.guest-message.submit":
     case "thread.guest-message.dismiss":
+    case "thread.moved.set":
+    case "thread.moved.clear":
     case "thread.settle":
     case "thread.auto-settle":
     case "thread.unsettle":
@@ -790,6 +793,7 @@ function delegatedTasksStopEffect(command: {
 }
 
 const WORKSPACE_PREPARATION_INPUT = "Preparing workspace";
+const THREAD_TRANSFER_IMPORT_EVENT_PREFIX = "thread-transfer-import:v1";
 /** How long automatic settlement waits for a queued turn to start. */
 export const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
 const RUNTIME_REQUEST_DELIVERY_FAILED_MESSAGE =
@@ -3595,6 +3599,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     (effect) => Effect.ignore(effect),
   );
 
+  // A launch without a message prepares its worktree with no run to queue behind. A message
+  // waits for it, outside the thread lock the bind needs, rather than start in the checkout.
+  const awaitLaunchWorktree = Effect.fn("Orchestrator.awaitLaunchWorktree")(
+    function* (threadId: ThreadId) {
+      if (!(yield* worktreeSetupTracker.workspaceIsHeld(threadId))) return;
+      const { thread, runs } = yield* projectionStore.getThreadRecords(threadId, ["runs"]);
+      if (thread.worktreePath !== null || runs.some(isActiveRun)) return;
+      yield* worktreeSetupTracker.awaitWorkspaceRelease(threadId);
+    },
+    (effect) => Effect.ignore(effect),
+  );
+
   const requeueUnreadSteers = Effect.fn("Orchestrator.requeueUnreadSteers")(function* (
     threadId: ThreadId,
     runIds?: ReadonlyArray<RunId>,
@@ -4137,6 +4153,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.driver": command.modelSelection.instanceId,
     });
 
+    const importedHistory = command.importedHistory;
+    const hasConflictingImport =
+      importedHistory !== undefined &&
+      (command.importedNativeThread !== undefined || command.initialMessage !== undefined);
+    if (hasConflictingImport) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Imported history cannot come with a native thread or a first message.",
+      });
+    }
+
     // Tombstones reserve their ids too; recreating one would overwrite its history.
     const existing = yield* findThread(command.threadId);
     if (existing !== null) {
@@ -4162,6 +4190,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       branch: command.branch,
       worktreePath: command.worktreePath,
       activeProviderThreadId: null,
+      // The first turn hands imported history to the provider like a V1 import.
+      ...(importedHistory === undefined ? {} : { historyOrigin: "v1_import" }),
+      ...(importedHistory === undefined
+        ? {}
+        : {
+            continuedFrom: {
+              environmentId: importedHistory.source.environmentId,
+              threadId: importedHistory.source.threadId,
+              title: importedHistory.source.title,
+              // An older sender sends no label.
+              label: importedHistory.source.label ?? importedHistory.source.environmentId,
+            },
+          }),
       pullRequests: [],
       ...(command.linkOrigin === undefined ? {} : { linkOrigin: command.linkOrigin }),
       // Only stamped work names a remote parent, so a client cannot claim one.
@@ -4194,6 +4235,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: thread,
     });
+    if (importedHistory !== undefined) {
+      const importedEvents = [
+        ...(importedHistory.omittedCount > 0
+          ? [
+              importedHistoryTruncatedEvent({
+                threadId: command.threadId,
+                at: now,
+                omittedMessageCount: importedHistory.omittedCount,
+                eventPrefix: THREAD_TRANSFER_IMPORT_EVENT_PREFIX,
+              }),
+            ]
+          : []),
+        ...importedHistory.messages.flatMap((message, index) =>
+          importedMessageEvents({
+            threadId: command.threadId,
+            index,
+            message,
+            eventPrefix: THREAD_TRANSFER_IMPORT_EVENT_PREFIX,
+          }),
+        ),
+      ];
+      yield* Effect.forEach(importedEvents, (event) => emitEvent(event), { discard: true });
+    }
     if (command.importedNativeThread !== undefined) {
       yield* emitEvent({
         type: "provider-thread.updated",
@@ -4448,6 +4512,42 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: decided.success,
     });
     yield* releaseGuestAttachments(command, thread.guestShare, decided.success.guestShare, effects);
+  });
+
+  const dispatchThreadMoved = Effect.fn("orchestrationV2.dispatch.threadMoved")(function* (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "thread.moved.set" | "thread.moved.clear" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const thread = yield* projectionStore
+      .getThread(command.threadId)
+      .pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+        ),
+      );
+    if (thread.deletedAt !== null) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} is deleted.`,
+      });
+    }
+    const movedTo = command.type === "thread.moved.set" ? command.movedTo : null;
+    if (movedTo === null && thread.movedTo == null) return;
+    const now = yield* DateTime.now;
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "thread.moved",
+      threadId: command.threadId,
+      providerInstanceId: thread.providerInstanceId,
+      occurredAt: now,
+      payload: { ...thread, movedTo, updatedAt: now },
+    });
   });
 
   // Emitted before the message so the send and the status change commit together, and so
@@ -4917,6 +5017,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.type !== "thread.settle" &&
       liveSessions.length > 0
     ) {
+      // Detaching ends a started turn, which may never report completion. Only a workspace
+      // handoff (compare-and-set or continuation) ends its own caller's turn on purpose.
+      if (
+        command.type === "thread.metadata.update" &&
+        command.expectedWorktreePath === undefined &&
+        command.continuation === undefined &&
+        (yield* loadProjectionForCommand(command, ["runs"], { turnItemTypes: [] })).runs.some(
+          (run) => run.status === "starting" || run.status === "running",
+        )
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} has an active turn. Stop the current turn to switch worktrees.`,
+        });
+      }
       // The provider context holds only the active and target provider threads; a session kept
       // busy by an earlier queued hand-off owns neither, so probe every thread of this one.
       const { providerThreads } = yield* projectionStore
@@ -7593,6 +7709,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
       projection = applyToProjection(projection, event);
     }
+    // Same rule as the snooze: a message someone sent here means work goes on here.
+    if (projection.thread.movedTo != null && !automaticWake) {
+      const now = yield* DateTime.now;
+      const event = yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.moved",
+        threadId: command.threadId,
+        providerInstanceId: projection.thread.providerInstanceId,
+        occurredAt: now,
+        payload: { ...projection.thread, movedTo: null, updatedAt: now },
+      });
+      projection = applyToProjection(projection, event);
+    }
     const userMessages = projection.messages.filter((message) => message.role === "user");
     // The recent runs of a compacted thread can hold only a `/compact` while an older prompt
     // exists, so when every loaded prompt is one, every user message is checked.
@@ -8107,6 +8238,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
+    // A launch without a message prepares its worktree with no run to queue behind; a message
+    // now would start in the project checkout and lose its turn when the worktree is bound.
+    if (
+      activeRun === undefined &&
+      worktreeMissingRun === undefined &&
+      (dispatchMode.type === "queue_after_active" || dispatchMode.type === "start_immediately") &&
+      projection.thread.worktreePath === null &&
+      (yield* worktreeSetupTracker.workspaceIsHeld(command.threadId))
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} is still preparing its worktree. Send the message once its worktree is set up.`,
+      });
+    }
     // A steer whose run already ended still keeps its place in the queue.
     const steerFollowUpSource =
       command.steerFollowUpOfRunId === undefined
@@ -16306,6 +16452,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.guest-message.dismiss":
         yield* dispatchGuestShare(command, events, effects);
         break;
+      case "thread.moved.set":
+      case "thread.moved.clear":
+        yield* dispatchThreadMoved(command, events);
+        break;
       case "provider-session.detach":
         yield* dispatchProviderSessionDetach(command, events, effects);
         break;
@@ -16681,6 +16831,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "subagent.stop" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||
+          // Keeping work here again after the marker cleared is not an error.
+          command.type === "thread.moved.clear" ||
           (command.type === "thread.delete" && command.onlyIfUnused === true),
         (_planned) =>
           new OrchestratorDispatchError({
@@ -16909,6 +17061,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.sourcePoint.type === "latest_stable"
     ) {
       yield* awaitLatestRunCapture(command.sourceThreadId);
+    }
+    if (
+      command.type === "message.dispatch" &&
+      (command.dispatchMode.type === "start_immediately" ||
+        command.dispatchMode.type === "queue_after_active")
+    ) {
+      yield* awaitLaunchWorktree(command.threadId);
     }
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),

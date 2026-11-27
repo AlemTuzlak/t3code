@@ -71,6 +71,7 @@ import { ThreadPullRequestsSheet } from "./features/threads/ThreadPullRequestsSh
 import { ThreadAgentsSheet } from "./features/threads/ThreadAgentsSheet";
 import { LinkedThreadSheet } from "./features/threads/LinkedThreadSheet";
 import { ThreadGuestShareSheet } from "./features/threads/ThreadGuestShareSheet";
+import { ContinueOnMachineSheet } from "./features/threads/ContinueOnMachineSheet";
 import { ThreadBackgroundWorkSheet } from "./features/threads/ThreadBackgroundWorkSheet";
 import { ThreadQueueSheet } from "./features/threads/ThreadQueueControl";
 import {
@@ -817,6 +818,10 @@ const RootStackConfig = createWorkspaceStackNavigator({
       screen: ThreadGuestShareSheet,
       options: sheetRoute({ detent: 0.5 }),
     }),
+    ThreadContinueOnMachine: createNativeStackScreen({
+      screen: ContinueOnMachineSheet,
+      options: sheetRoute({ detent: 0.8, androidMaxDetent: 0.95 }),
+    }),
     GitOverview: createNativeStackScreen({
       screen: GitOverviewSheet,
       linking: `${THREAD_LINKING_PREFIX}/git`,
@@ -926,7 +931,7 @@ export const RootStack = RootStackConfig.with(function AdaptiveRootStack({ Navig
   return (
     <Navigator
       screenLayout={(props) => <GuardedScreenLayout {...props} />}
-      screenOptions={({ route, navigation }) => {
+      screenOptions={({ route, navigation, theme }) => {
         const title =
           route.name === "Home"
             ? getCompactBrandHeaderOptions(undefined, resolve).title
@@ -935,6 +940,9 @@ export const RootStack = RootStackConfig.with(function AdaptiveRootStack({ Navig
               : resolve(ROUTE_TITLES[route.name]);
         return {
           ...(title === undefined ? {} : { title }),
+          // In release builds react-native-screens decides the iOS status bar style, and its
+          // "auto" style can follow the phone's appearance instead of the app's theme.
+          ...(Platform.OS === "ios" ? { statusBarStyle: theme.dark ? "light" : "dark" } : {}),
           ...(Platform.OS === "android"
             ? {
                 animation: androidWorkspaceDestinationAnimation(

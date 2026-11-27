@@ -1,4 +1,5 @@
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+import { offersLinkedEnvironments } from "@t3tools/client-runtime/link-request";
 import {
   parseScopedThreadKey,
   scopeProjectRef,
@@ -7,7 +8,10 @@ import {
 } from "@t3tools/client-runtime/environment";
 import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { canSnooze, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
-import { threadRuntimeCanArchive } from "@t3tools/client-runtime/state/models";
+import {
+  threadRuntimeCanArchive,
+  type ThreadRuntimeSummary,
+} from "@t3tools/client-runtime/state/models";
 import {
   AuthOrchestrationOperateScope,
   AuthSourceControlWriteScope,
@@ -285,6 +289,27 @@ export function canTurnThreadIntoProject(threadRef: ScopedThreadRef): boolean {
     projectId: thread.projectId,
   });
   return project !== null && isScratchProject(project, config.scratchWorkspaceRoot);
+}
+
+/** The server refuses to continue a thread while a run is preparing, starting, running or waiting. */
+export function threadRuntimeBlocksContinueOnMachine(runtime: ThreadRuntimeSummary | null) {
+  return !threadRuntimeCanArchive(runtime) || runtime?.status === "waiting";
+}
+
+/**
+ * Null when the thread cannot continue on a linked machine: it needs a project with a git remote,
+ * on a server whose Linked environments beta is on. "busy" while a run blocks the move.
+ */
+export function canContinueThreadOnMachine(threadRef: ScopedThreadRef) {
+  const thread = readThreadShell(threadRef);
+  const config = appAtomRegistry.get(environmentServerConfigsAtom).get(threadRef.environmentId);
+  if (!thread || !offersLinkedEnvironments(config)) return null;
+  const project = readProject({
+    environmentId: threadRef.environmentId,
+    projectId: thread.projectId,
+  });
+  if (project?.repositoryIdentity == null) return null;
+  return threadRuntimeBlocksContinueOnMachine(thread.runtime) ? "busy" : "ready";
 }
 
 function threadOperationFailure(target: ScopedThreadRef) {

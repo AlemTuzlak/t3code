@@ -823,6 +823,24 @@ it.live("resolves a path inside a git worktree of the project's repository to th
     assert.include(ambiguous.message, "sample (project-sample)");
     assert.include(ambiguous.message, "feature (project-feature)");
 
+    const aliasRoot = path.join(root, "sample-alias");
+    yield* Effect.promise(() => NodeFSP.symlink(repo, aliasRoot, "junction"));
+    const alias = project("project-alias", aliasRoot);
+    const nested = project("project-nested", path.join(repo, "pkg"));
+    assert.deepStrictEqual(
+      yield* resolveFrom([sample, alias, nested], path.join(worktree, "pkg")),
+      nested,
+    );
+    const aliased = yield* Effect.flip(resolveFrom([sample, alias], worktree));
+    assert.strictEqual(aliased._tag, "ThreadUsageError");
+    assert.include(aliased.message, "sample (project-sample)");
+    assert.include(aliased.message, "sample-alias (project-alias)");
+
+    // A moved checkout stays listed as prunable, even once its old path exists again.
+    yield* fileSystem.rename(feature, path.join(root, "moved-feature"));
+    yield* fileSystem.makeDirectory(feature);
+    assert.deepStrictEqual(yield* resolveFrom([sample, featureProject], featureWorktree), sample);
+
     // An inherited relative GIT_DIR resolves against Git's cwd, where no repository is.
     vi.stubEnv("GIT_DIR", ".git");
     yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllEnvs()));

@@ -126,6 +126,7 @@ import {
   useThreadSelectionStore,
 } from "../threadSelectionStore";
 import {
+  canContinueThreadOnMachine,
   canTurnThreadIntoProject,
   useAcknowledgeThreadWoke,
   useThreadActions,
@@ -166,6 +167,7 @@ import { readEnvironmentScope, useEnvironmentScope } from "../state/session";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { canShareWithGuestAtom } from "./chat/guestShareAvailability";
 import { openGuestShareDialog } from "./chat/guestShareDialogState";
+import { openContinueOnMachineDialog } from "./chat/ContinueOnMachineDialog";
 import {
   buildThreadRouteParams,
   resolveActiveThreadRouteRef,
@@ -1087,7 +1089,10 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   } | null>(null);
   const snoozingThreadKeysRef = useRef(new Set<string>());
   const removeFromSelection = useThreadSelectionStore((s) => s.removeFromSelection);
-  const openAddProjectCommandPalette = () => openCommandPalette({ open: "add-project" });
+  const openAddProjectCommandPalette = () => {
+    if (isMobile) setOpenMobile(false);
+    openCommandPalette({ open: "add-project" });
+  };
   const routeThreadRef = resolveActiveThreadRouteRef(
     routeTarget,
     routeDraftThread,
@@ -2415,7 +2420,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               : []),
             {
               id: "settle",
-              label: gt("Settle ({count})", { count }),
+              label: gt("Settle ({count})", { count: settlingThreads.length }),
               disabled: settlingThreads.length === 0 || !canOperateThreads(settlingThreads, true),
             },
             ...(canSnoozeSelection
@@ -2759,6 +2764,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                 canShareWithGuestAtom(threadRef.environmentId),
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+              canContinueOnMachine: canContinueThreadOnMachine(threadRef),
               canRename: !fromSearch,
               supports: {
                 settlement: configLoaded,
@@ -2810,6 +2816,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               });
             return;
           case "new-thread-on-branch": {
+            if (isMobile) setOpenMobile(false);
             const result = await settlePromise(() =>
               handleNewThread(scopeProjectRef(thread.environmentId, thread.projectId), {
                 branch: thread.branch,
@@ -2888,6 +2895,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
             return;
           case "share-guest":
             openGuestShareDialog(threadRef);
+            return;
+          case "continue-on-machine":
+            openContinueOnMachineDialog(threadRef);
             return;
           case "regenerate-title": {
             if (isRegeneratingTitle) return;

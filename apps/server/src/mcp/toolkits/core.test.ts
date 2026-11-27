@@ -19,6 +19,7 @@ import {
   RuntimeRequestId,
   ThreadId,
   TurnItemId,
+  type ThreadReceiveInput,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2ThreadShell,
@@ -68,6 +69,7 @@ import { ThreadToolkit } from "./thread/tools.ts";
 import * as PeerForwarding from "../../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../../peer/PeerLinkRequests.ts";
 import * as PeerLinks from "../../peer/PeerLinks.ts";
+import * as ThreadContinuation from "../../peer/ThreadContinuation.ts";
 
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
@@ -86,17 +88,22 @@ const decodeThreadSearchResult = Schema.decodeUnknownEffect(
   ThreadToolkit.tools.t3_thread_search.successSchema,
 );
 
-const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
-  Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
-  Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
-  Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
-  Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
-  Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
-  // Tool analytics read the registry whenever one is present.
-  Layer.provide(
-    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
-  ),
-);
+const layerThreadToolkitWith = (
+  continuation: Partial<ThreadContinuation.ThreadContinuation["Service"]>,
+) =>
+  McpHttpServer.layerThreadToolkit.pipe(
+    Layer.provide(Layer.mock(ThreadContinuation.ThreadContinuation)(continuation)),
+    Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+    Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+    Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+    Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+    Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+    // Tool analytics read the registry whenever one is present.
+    Layer.provide(
+      Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+    ),
+  );
+const layerThreadToolkit = layerThreadToolkitWith({});
 
 const threadId = ThreadId.make("mcp-core-thread");
 const scope: McpInvocationContext.McpInvocationScope = {
@@ -962,6 +969,7 @@ it.effect("search names the calling thread, so an agent can tell its own match a
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
         Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
         Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+        Layer.provide(Layer.mock(ThreadContinuation.ThreadContinuation)({})),
       ),
     ),
   ),
@@ -1265,6 +1273,7 @@ it.effect.each([
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
         Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
         Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+        Layer.provide(Layer.mock(ThreadContinuation.ThreadContinuation)({})),
         Layer.provide(
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({
             list: () => Effect.succeed({ tasks }),
@@ -1305,6 +1314,7 @@ it.effect("run_scheduled_task_now reports why a started run failed to dispatch",
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
         Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
         Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+        Layer.provide(Layer.mock(ThreadContinuation.ThreadContinuation)({})),
         Layer.provide(
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({
             list: () =>
@@ -1778,3 +1788,195 @@ it.effect(
     );
   },
 );
+
+const laptop = EnvironmentId.make("environment-laptop");
+const box = EnvironmentId.make("environment-box");
+const receiveInput: ThreadReceiveInput = {
+  repository: { remoteUrl: "https://github.com/acme/app.git", canonicalKey: "github.com/acme/app" },
+  remoteName: "origin",
+  branch: "feat/login",
+  title: "Fix login",
+  importedHistory: {
+    messages: [{ role: "user", text: "Fix the login bug.", createdAt: "2026-11-27T09:00:00.000Z" }],
+    omittedCount: 0,
+    source: { environmentId: laptop, threadId: ThreadId.make("laptop-thread"), title: "Fix login" },
+  },
+};
+
+const callThreadTool = (
+  name: string,
+  args: Record<string, unknown>,
+  invocation: McpInvocationContext.McpInvocationScope,
+) =>
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    return yield* server
+      .callTool({ name, arguments: args })
+      .pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.provideService(McpSchema.McpServerClient, client),
+      );
+  });
+
+const continuationToolkit = (
+  continuation: Partial<ThreadContinuation.ThreadContinuation["Service"]>,
+) =>
+  layerThreadToolkitWith(continuation).pipe(
+    Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+    Layer.provide(NodeCrypto.layer),
+    Layer.provide(
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        // The calling thread's turn is live, as it is while its agent calls a tool.
+        getThreadShell: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+        getProjectThreadRecords: ({ threadId: id }) =>
+          Effect.succeed(
+            McpToolAccessTestkit.idleThreadProjection(McpToolAccessTestkit.liveThreadShell(id)),
+          ),
+      }),
+    ),
+  );
+
+const linkedClientScope: McpInvocationContext.McpInvocationScope = {
+  ...clientScope("full-access"),
+  client: { sessionId: "link-1", label: "Laptop", access: "full-access", linked: true },
+};
+
+it.effect(
+  "t3_thread_receive is offered to outside clients while links are on, never to threads",
+  () =>
+    Effect.gen(function* () {
+      const received = yield* callThreadTool("t3_thread_receive", receiveInput, linkedClientScope);
+      expect(received.isError).toBe(false);
+      expect(received.structuredContent).toEqual({
+        threadId: "box-thread",
+        projectId: "box-project",
+        title: "Fix login",
+      });
+
+      const fromThread = yield* callThreadTool("t3_thread_receive", receiveInput, scope).pipe(
+        Effect.flip,
+      );
+      expect(fromThread.message).toContain("Tool 't3_thread_receive' not found");
+
+      const linksOff = yield* callThreadTool("t3_thread_receive", receiveInput, {
+        ...linkedClientScope,
+        linkedEnvironments: false,
+      }).pipe(Effect.flip);
+      expect(linksOff.message).toContain("Tool 't3_thread_receive' not found");
+    }).pipe(
+      Effect.provide(
+        continuationToolkit({
+          receive: (input) =>
+            Effect.succeed({
+              threadId: ThreadId.make("box-thread"),
+              projectId: ProjectId.make("box-project"),
+              title: input.title,
+            }),
+        }),
+      ),
+    ),
+);
+
+it.effect("t3_thread_receive refuses a full-access client that is not a linked environment", () => {
+  const received: Array<ThreadReceiveInput> = [];
+  return Effect.gen(function* () {
+    const result = yield* callThreadTool(
+      "t3_thread_receive",
+      receiveInput,
+      clientScope("full-access"),
+    );
+    expect(declaredFailure(result)).toMatchObject({ code: "capability_denied" });
+    expect(received).toEqual([]);
+  }).pipe(
+    Effect.provide(
+      continuationToolkit({
+        receive: (input) =>
+          Effect.sync(() => {
+            received.push(input);
+            return {
+              threadId: ThreadId.make("box-thread"),
+              projectId: ProjectId.make("box-project"),
+              title: input.title,
+            };
+          }),
+      }),
+    ),
+  );
+});
+
+it.effect("continue_on needs toEnvironmentId", () =>
+  Effect.gen(function* () {
+    const result = yield* callThreadTool(
+      "t3_thread_transfer",
+      { action: "continue_on", threadId: "laptop-thread" },
+      clientScope("full-access"),
+    );
+    expect(declaredFailure(result)).toMatchObject({
+      code: "invalid_request",
+      message: "This action needs `toEnvironmentId`.",
+    });
+  }).pipe(Effect.provide(continuationToolkit({}))),
+);
+
+type SentContinuation = Parameters<ThreadContinuation.ThreadContinuation["Service"]["send"]>;
+
+/** A continuation that records each send and answers with the thread it became on the box. */
+const recordingContinuation = (sent: Array<SentContinuation>) =>
+  continuationToolkit({
+    send: (...args) =>
+      Effect.sync(() => {
+        sent.push(args);
+        return {
+          targetEnvironmentId: args[0].targetEnvironmentId,
+          targetThreadId: ThreadId.make("box-thread"),
+          title: "Fix login",
+        };
+      }),
+  });
+
+it.effect("continue_on sends the thread and links the thread it became there", () => {
+  const sent: Array<SentContinuation> = [];
+  return Effect.gen(function* () {
+    const result = yield* callThreadTool(
+      "t3_thread_transfer",
+      { action: "continue_on", threadId: "laptop-thread", toEnvironmentId: box },
+      clientScope("full-access"),
+    );
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      targetEnvironmentId: "environment-box",
+      targetThreadId: "box-thread",
+      title: "Fix login",
+      link: "[Fix login](t3-thread://v2/environment-box/box-thread)",
+    });
+    expect(sent).toEqual([
+      [
+        { threadId: "laptop-thread", targetEnvironmentId: "environment-box", commitAndPush: false },
+        {
+          limits: { runtimeMode: "full-access", interactionMode: "default" },
+          threadId: undefined,
+        },
+      ],
+    ]);
+  }).pipe(Effect.provide(recordingContinuation(sent)));
+});
+
+it.effect("continue_on from the thread itself moves it and tells its agent to end the turn", () => {
+  const sent: Array<SentContinuation> = [];
+  return Effect.gen(function* () {
+    const result = yield* callThreadTool(
+      "t3_thread_transfer",
+      { action: "continue_on", toEnvironmentId: box },
+      scope,
+    );
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      targetThreadId: "box-thread",
+      note: "This thread moved there. End your turn now.",
+    });
+    expect(sent[0]?.[1]).toEqual({
+      limits: { runtimeMode: "full-access", interactionMode: "default" },
+      threadId,
+    });
+  }).pipe(Effect.provide(recordingContinuation(sent)));
+});

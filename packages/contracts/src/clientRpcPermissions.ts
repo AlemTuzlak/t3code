@@ -16,6 +16,7 @@ import {
 import { PeerLinkLinkPairingInput } from "./peerLink.ts";
 import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
 import { WS_METHODS } from "./rpc.ts";
+import { ThreadContinueOnEnvironmentInput } from "./threadContinuation.ts";
 
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
@@ -56,6 +57,7 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   // Writing a guide runs a model on this environment's providers, which reading one does not.
   [WS_METHODS.pullRequestsGenerateReviewGuide]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectsCreateFromThread]: AuthOrchestrationOperateScope,
+  [WS_METHODS.threadsContinueOnEnvironment]: AuthOrchestrationOperateScope,
   [WS_METHODS.sourceControlCloneRepository]: AuthSourceControlWriteScope,
   [WS_METHODS.sourceControlPublishRepository]: AuthSourceControlWriteScope,
   [WS_METHODS.sourceControlStar]: AuthSourceControlWriteScope,
@@ -111,6 +113,7 @@ export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 const decodePrepareThread = Schema.decodeUnknownSync(GitPreparePullRequestThreadInput);
 const decodeStackedAction = Schema.decodeUnknownSync(GitRunStackedActionInput);
 const decodeLinkPairing = Schema.decodeUnknownSync(PeerLinkLinkPairingInput);
+const decodeContinueOnEnvironment = Schema.decodeUnknownSync(ThreadContinueOnEnvironmentInput);
 
 export function clientRpcRequiredScopes(
   method: string,
@@ -133,6 +136,14 @@ export function clientRpcRequiredScopes(
   if (method === WS_METHODS.peerLinksPairLink && input !== undefined) {
     const held = mcpClientScopes(decodeLinkPairing(input).access);
     return [AuthAccessWriteScope, ...held];
+  }
+  // Committing and pushing the thread's work first is a source control write, as Commit & push is.
+  if (
+    method === WS_METHODS.threadsContinueOnEnvironment &&
+    input !== undefined &&
+    decodeContinueOnEnvironment(input).commitAndPush
+  ) {
+    return [AuthOrchestrationOperateScope, AuthSourceControlWriteScope];
   }
   if (method === WS_METHODS.guestShareCreate) {
     return [AuthAccessWriteScope, AuthOrchestrationReadScope];
